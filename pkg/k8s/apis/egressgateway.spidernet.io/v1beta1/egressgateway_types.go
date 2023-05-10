@@ -72,7 +72,14 @@ type Eips struct {
 	// +kubebuilder:validation:Optional
 	IPv6 string `json:"ipv6,omitempty"`
 	// +kubebuilder:validation:Optional
-	Policies []string `json:"policies,omitempty"`
+	Policies []Policy `json:"policies,omitempty"`
+}
+
+type Policy struct {
+	// +kubebuilder:validation:Optional
+	Name string `json:"name,omitempty"`
+	// +kubebuilder:validation:Optional
+	Namespace string `json:"namespace,omitempty"`
 }
 
 func init() {

@@ -7,7 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
+	"math/rand"
+	"net"
+	"time"
 
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
@@ -16,13 +18,10 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"github.com/spidernet-io/egressgateway/pkg/config"
+	"github.com/spidernet-io/egressgateway/pkg/constant"
 	egress "github.com/spidernet-io/egressgateway/pkg/k8s/apis/egressgateway.spidernet.io/v1beta1"
 	"github.com/spidernet-io/egressgateway/pkg/utils"
 )
@@ -114,9 +113,9 @@ func (r egnReconciler) reconcileNode(ctx context.Context, req reconcile.Request,
 		ready = true
 	}
 
-	for _, egn := range affectedEgressGatewayList.Items {
+	for _, eg := range affectedEgressGatewayList.Items {
 		index := -1
-		for i, selNode := range egn.Status.NodeList {
+		for i, selNode := range eg.Status.NodeList {
 			if selNode.Name == node.Name {
 				index = i
 			}
@@ -125,17 +124,17 @@ func (r egnReconciler) reconcileNode(ctx context.Context, req reconcile.Request,
 			return reconcile.Result{}, err
 		}
 		change := false
-		if egn.Status.NodeList[index].Ready != ready {
+		if eg.Status.NodeList[index].Ready != ready {
 			change = true
-			egn.Status.NodeList[index].Ready = ready
+			eg.Status.NodeList[index].Ready = ready
 		}
-		if r.updateActive(egn.Status.NodeList) {
-			log.Sugar().Debugf("egress node %s active changed", egn.Name)
+		if r.updateActive(eg.Status.NodeList) {
+			log.Sugar().Debugf("egress node %s active changed", eg.Name)
 			change = true
 		}
 		if change {
-			log.Sugar().Debugf("update egress gateway node %s", mustMarshalJson(egn.Status))
-			err = r.client.Status().Update(ctx, &egn)
+			log.Sugar().Debugf("update egress gateway node %s", mustMarshalJson(eg.Status))
+			err = r.client.Status().Update(ctx, &eg)
 			if err != nil {
 				return reconcile.Result{}, err
 			}
@@ -150,161 +149,7 @@ func (r egnReconciler) reconcileNode(ctx context.Context, req reconcile.Request,
 // - update egress gateway node
 func (r egnReconciler) reconcileEG(ctx context.Context, req reconcile.Request, log *zap.Logger) (reconcile.Result, error) {
 	deleted := false
-	egn := &egress.EgressGateway{}
-	err := r.client.Get(ctx, req.NamespacedName, egn)
-	if err != nil {
-		if !errors.IsNotFound(err) {
-			return reconcile.Result{}, err
-		}
-		deleted = true
-	}
-	deleted = deleted || !egn.GetDeletionTimestamp().IsZero()
-
-	if deleted {
-		log.Info("request item is deleted")
-		return reconcile.Result{}, nil
-	}
-
-	if egn.Spec.NodeSelector.Selector == nil {
-		log.Info("nodeSelector is nil, skip reconcile")
-		return reconcile.Result{}, nil
-	}
-
-	// diff ranges
-
-	// diff nodeSelector
-
-	nodeList := &corev1.NodeList{}
-	selNodes, err := metav1.LabelSelectorAsSelector(egn.Spec.NodeSelector.Selector)
-	if err != nil {
-		return reconcile.Result{}, err
-	}
-	err = r.client.List(ctx, nodeList, &client.ListOptions{
-		LabelSelector: selNodes,
-	})
-	if err != nil {
-		return reconcile.Result{}, err
-	}
-
-	log.Sugar().Debugf("number of selected nodes: %d", len(nodeList.Items))
-
-	egressNodeList := make([]egress.EgressNodeList, 0)
-	for _, node := range nodeList.Items {
-		log.Sugar().Debugf("check node: %s", node.Name)
-
-		eNode := new(egress.EgressNode)
-		err = r.client.Get(ctx, types.NamespacedName{Name: node.Name}, eNode)
-		if err != nil {
-			if !errors.IsNotFound(err) {
-				return reconcile.Result{}, fmt.Errorf("get egress node with error: %v", err)
-			}
-			eNode = &egress.EgressNode{ObjectMeta: metav1.ObjectMeta{Name: node.Name}}
-			err := r.client.Create(ctx, eNode)
-			if err != nil {
-				return reconcile.Result{}, err
-			}
-		}
-
-		log.Sugar().Debug("get egress node: ", node.Name)
-
-		isReady := false
-		if utils.IsNodeVxlanReady(eNode,
-			r.config.FileConfig.EnableIPv4,
-			r.config.FileConfig.EnableIPv6) {
-			isReady = true
-		}
-
-		log.Sugar().Debugf("egress node is ready: %v", isReady)
-
-		egressNodeList = append(egressNodeList, egress.SelectedEgressNode{
-			Name:  eNode.Name,
-			Ready: isReady,
-		})
-	}
-
-	hasReady := false
-	hasActive := false
-	diff := difference(egn.Status.NodeList, egressNodeList,
-		func(t1, t2 egress.SelectedEgressNode) bool {
-			if t1.Active {
-				hasActive = true
-			}
-			if t1.Ready {
-				hasReady = true
-			}
-			if t1.Name != t2.Name {
-				return true
-			}
-			return false
-		})
-	if !diff && hasReady && hasActive {
-		log.Info("skip update egress node gateway status, it hasn't changed")
-		return reconcile.Result{}, nil
-	}
-
-	if diff {
-		egn.Status.NodeList = mergeEgressNodes(egn.Status.NodeList, egressNodeList)
-	}
-
-	// for there, it has been change, so we do not need to double-check
-	r.updateActive(egn.Status.NodeList)
-	log.Sugar().Infof("update egress gateway node %s", mustMarshalJson(egn.Status))
-	err = r.client.Status().Update(ctx, egn)
-	if err != nil {
-		return reconcile.Result{}, err
-	}
-
-	return reconcile.Result{}, nil
-}
-
-func mustMarshalJson(obj interface{}) string {
-	raw, err := json.Marshal(obj)
-	if err != nil {
-		return ""
-	}
-	return string(raw)
-}
-
-func difference(a, b egress.SelectedEgressNodes, f func(t1, t2 egress.SelectedEgressNode) bool) bool {
-	if len(a) != len(b) {
-		return true
-	}
-	sort.Sort(a)
-	sort.Sort(b)
-	for i := range a {
-		if f(a[i], b[i]) {
-			return true
-		}
-	}
-	return false
-}
-
-func mergeEgressNodes(oldList, preList []egress.SelectedEgressNode) []egress.SelectedEgressNode {
-	m := make(map[string][]egress.InterfaceStatus, 0)
-	for _, node := range oldList {
-		m[node.Name] = node.InterfaceStatus
-	}
-	newList := make([]egress.SelectedEgressNode, 0)
-	for _, item := range preList {
-		interfaceStatus, ok := m[item.Name]
-		if ok {
-			item.InterfaceStatus = interfaceStatus
-		}
-		newList = append(newList, item)
-	}
-	return newList
-}
-
-// reconcileEN reconcile egress node
-// goal:
-// - add node
-// - update node
-// - remove node
-func (r egnReconciler) reconcileEGP(ctx context.Context,
-	req reconcile.Request, log *zap.Logger) (reconcile.Result, error) {
-
-	deleted := false
-	eg := &egress.EgressNode{}
+	eg := &egress.EgressGateway{}
 	err := r.client.Get(ctx, req.NamespacedName, eg)
 	if err != nil {
 		if !errors.IsNotFound(err) {
@@ -314,222 +159,318 @@ func (r egnReconciler) reconcileEGP(ctx context.Context,
 	}
 	deleted = deleted || !eg.GetDeletionTimestamp().IsZero()
 
-	affectedEgressGatewayList := &egress.EgressGatewayList{}
-	if err := r.client.List(context.Background(), affectedEgressGatewayList,
-		&client.ListOptions{FieldSelector: fields.OneTermEqualSelector(
-			indexEgressNodeEgressGateway,
-			req.NamespacedName.String()),
-		}); err != nil {
-		return reconcile.Result{}, nil
-	}
-
 	if deleted {
 		log.Info("request item is deleted")
-		// if req obj is deleted, we should be deleted it in EgressGateway used.
-		for _, egn := range affectedEgressGatewayList.Items {
-			changed := false
-			filterFunc := func(node egress.SelectedEgressNode) bool {
-				if node.Name == req.Name {
-					changed = true
-					return false
-				}
-				return true
-			}
-			preList := filter(egn.Status.NodeList, filterFunc)
-			egn.Status.NodeList = preList
-			if r.updateActive(preList) {
-				log.Sugar().Debugf("update egress gateway node\n%s", mustMarshalJson(egn))
-				changed = true
-			}
-			if changed {
-				log.Sugar().Debugf("update egress gateway node\n%s", mustMarshalJson(egn))
-				err = r.client.Status().Update(ctx, &egn)
-				if err != nil {
-					return reconcile.Result{}, err
-				}
-			}
-		}
 		return reconcile.Result{}, nil
 	}
 
-	for _, item := range affectedEgressGatewayList.Items {
-		exits := false
-		changed := false
+	if eg.Spec.NodeSelector.Selector == nil {
+		log.Info("nodeSelector is nil, skip reconcile")
+		return reconcile.Result{}, nil
+	}
 
-		for _, node := range item.Status.NodeList {
-			if node.Name == req.Name {
-				exits = true
+	// diff nodeSelector
+	// 1、获取当前最新符合条件的 node
+	// 2、通过 status 的nodeList 拿到旧的节点信息
+	// 3、比较需要删除的节点
+	// 4、待删除节点有哪些 policy 的网关节点，重新选网关节点
+	// 5、EIP 再根据 policy 中的配置来生效。也就是说所有的 EIP 都会重新分配
+
+	// 1、获取当前最新符合条件的 node
+	newNodeList := &corev1.NodeList{}
+	selNodes, err := metav1.LabelSelectorAsSelector(eg.Spec.NodeSelector.Selector)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	err = r.client.List(ctx, newNodeList, &client.ListOptions{
+		LabelSelector: selNodes,
+	})
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	log.Sugar().Debugf("number of selected nodes: %d", len(newNodeList.Items))
+
+	// 2、拿到需要删除的节点
+	var delNodeList []egress.EgressIPStatus
+	for _, oldNode := range eg.Status.NodeList {
+		isDel := true
+		for _, node := range newNodeList.Items {
+			if oldNode.Name == node.Name {
+				isDel = false
+				break
 			}
 		}
-		if !exits {
-			// if it not exits, need to add it
-			changed = true
-			ready := false
-			node := new(corev1.Node)
-			err := r.client.Get(ctx, types.NamespacedName{Name: req.Name}, node)
+
+		if isDel {
+			delNodeList = append(delNodeList, oldNode)
+		}
+	}
+	log.Sugar().Debugf("delete a gateway nodes: %d", delNodeList)
+
+	// 3、重新分配网关节点
+	if len(delNodeList) != 0 {
+		// perNodeListMap 保存最新的 EgressGateway.status.nodeList
+		perNodeListMap := make(map[string]egress.EgressIPStatus, 0)
+		// 初始化 perNodeListMap
+		for _, node := range eg.Status.NodeList {
+			perNodeListMap[node.Name] = node
+		}
+
+		for _, node := range newNodeList.Items {
+			_, ok := perNodeListMap[node.Name]
+			if !ok {
+				perNodeListMap[node.Name] = egress.EgressIPStatus{Name: node.Name}
+			}
+		}
+
+		// 拿出需要重新选择网关节点的 policy
+		var reSetPolicies []egress.Policy
+		for _, item := range delNodeList {
+			for _, eip := range item.Eips {
+				reSetPolicies = append(reSetPolicies, eip.Policies...)
+			}
+		}
+
+		// 逐个 policy 重新分配
+		for _, policy := range reSetPolicies {
+			egp := &egress.EgressGatewayPolicy{}
+			err := r.client.Get(ctx, types.NamespacedName{Namespace: policy.Namespace, Name: policy.Name}, egp)
 			if err != nil {
-				if !errors.IsNotFound(err) {
-					log.Info("not found node, skip reconcile")
-				}
-				return reconcile.Result{}, err
+				return reconcile.Result{Requeue: true}, err
 			}
-			// double calculate status
-			if utils.IsNodeReady(node) && utils.IsNodeVxlanReady(eg,
-				r.config.FileConfig.EnableIPv4,
-				r.config.FileConfig.EnableIPv6,
-			) {
-				ready = true
-			}
-			item.Status.NodeList = append(item.Status.NodeList, egress.SelectedEgressNode{
-				Name:   req.Name,
-				Ready:  ready,
-				Active: false,
-			})
-		}
 
-		// exits, but renew active egress node
-		if r.updateActive(item.Status.NodeList) {
-			log.Sugar().Debugf("egress node %s active changed", item.Name)
-			changed = true
-		}
-
-		if changed {
-			log.Sugar().Debugf("update egress gateway node\n%s", mustMarshalJson(item))
-			err = r.client.Status().Update(ctx, &item)
+			// 选择 网关节点
+			perNode, err := r.allocatorNode("rr", perNodeListMap)
 			if err != nil {
-				return reconcile.Result{}, err
+				return reconcile.Result{Requeue: true}, err
 			}
+
+			// 分配 EIP
+			ipv4, ipv6, err := r.allocatorEIP("", perNode, *egp, *eg)
+			if err != nil {
+				return reconcile.Result{Requeue: true}, err
+			}
+
+			// 更新 EIP及policy
+			err = setEipStatus(ipv4, ipv6, perNode, egress.Policy{Name: egp.Name, Namespace: egp.Namespace}, perNodeListMap)
+			if err != nil {
+				return reconcile.Result{Requeue: true}, err
+			}
+			log.Sugar().Infof("reassigned: EgressGatewayPolicy %v IPV4 %v IPV6 %v", policy, ipv4, ipv6)
+		}
+
+		var perNodeList []egress.EgressIPStatus
+		for _, node := range perNodeListMap {
+			perNodeList = append(perNodeList, node)
+		}
+		eg.Status.NodeList = perNodeList
+
+		log.Sugar().Debugf("update egress gateway status\n%s", mustMarshalJson(eg.Status))
+		err = r.client.Status().Update(ctx, eg)
+		if err != nil {
+			log.Sugar().Errorf("update egress gateway status\n%s", mustMarshalJson(eg.Status))
+			return reconcile.Result{Requeue: true}, err
 		}
 	}
 
 	return reconcile.Result{}, nil
 }
 
-func (r egnReconciler) updateActive(list egress.SelectedEgressNodes) bool {
-	hasChanged := false
+func (r egnReconciler) allocatorNode(selNodePolicy string, nodeListMap map[string]egress.EgressIPStatus) (string, error) {
 
-	if r.config.FileConfig.ForwardMethod == config.ForwardMethodActiveActive {
-		for i, node := range list {
-			tmp := node.Ready
-			if node.Ready {
-				list[i].Active = true
+	if len(nodeListMap) == 0 {
+		err := fmt.Errorf("nodeList is empty")
+		return "", err
+	}
+	selNodePolicy = "rr"
+
+	var perNode string
+	perNodePolicyNum := 0
+	i := 0
+	for _, node := range nodeListMap {
+		policyNum := 0
+		for _, eip := range node.Eips {
+			policyNum += len(eip.Policies)
+		}
+
+		if i == 0 {
+			i++
+			perNode = node.Name
+			perNodePolicyNum = policyNum
+		} else if policyNum <= perNodePolicyNum {
+			perNode = node.Name
+			perNodePolicyNum = policyNum
+		}
+	}
+
+	return perNode, nil
+}
+
+func (r egnReconciler) allocatorEIP(selEipLolicy string, nodeName string, egp egress.EgressGatewayPolicy, eg egress.EgressGateway) (string, string, error) {
+
+	selEipLolicy = "rr"
+
+	if egp.Spec.EgressIP.UseNodeIP {
+		return "", "", nil
+	}
+
+	var perIpv4 string
+	var perIpv6 string
+
+	if r.config.FileConfig.EnableIPv4 {
+		var useIpv4s []net.IP
+		var useIpv4sByNode []net.IP
+
+		ipv4Ranges, _ := utils.MergeIPRanges(constant.IPv4, eg.Spec.Ranges.IPv4)
+
+		perIpv4 = egp.Spec.EgressIP.IPv4
+		if len(perIpv4) != 0 {
+			result, err := utils.IsIPIncludedRange(constant.IPv4, perIpv4, ipv4Ranges)
+			if err != nil {
+				return "", "", err
 			}
-			if tmp != node.Active {
-				hasChanged = true
+			if !result {
+				return "", "", fmt.Errorf("%v is not within the EIP range of EgressGateway %v", perIpv4, eg.Name)
+			}
+		} else {
+			// allocator ip
+			// 1、拿到已分配的 IP，计算出出未分配的IP
+			// 2、如果所有 IP 已使用，则从该节点的 EIP 中随机分配一个
+
+			for _, node := range eg.Status.NodeList {
+				for _, eip := range node.Eips {
+					if len(eip.IPv4) != 0 {
+						useIpv4s = append(useIpv4s, net.IP(eip.IPv4))
+					}
+				}
+			}
+
+			ipv4s, _ := utils.ParseIPRanges(constant.IPv4, ipv4Ranges)
+			freeIpv4s := utils.IPsDiffSet(ipv4s, useIpv4s, false)
+
+			if len(freeIpv4s) == 0 {
+				for _, node := range eg.Status.NodeList {
+					if node.Name == nodeName {
+						for _, eip := range node.Eips {
+							if len(eip.IPv4) != 0 {
+								useIpv4sByNode = append(useIpv4s, net.IP(eip.IPv4))
+							}
+						}
+					}
+				}
+
+				rand.Seed(time.Now().UnixNano())
+				perIpv4 = useIpv4sByNode[rand.Intn(len(useIpv4sByNode))].String()
+			} else {
+				rand.Seed(time.Now().UnixNano())
+				perIpv4 = freeIpv4s[rand.Intn(len(freeIpv4s))].String()
 			}
 		}
+	}
+
+	if r.config.FileConfig.EnableIPv6 {
+
+		if len(perIpv4) != 0 {
+			return perIpv4, getEIPStatus(perIpv4, eg).IPv6, nil
+		}
+
+		var useIpv6s []net.IP
+		var useIpv6sByNode []net.IP
+
+		ipv6Ranges, _ := utils.MergeIPRanges(constant.IPv6, eg.Spec.Ranges.IPv6)
+
+		perIpv6 = egp.Spec.EgressIP.IPv6
+		if len(perIpv6) != 0 {
+			result, err := utils.IsIPIncludedRange(constant.IPv4, perIpv4, ipv6Ranges)
+			if err != nil {
+				return "", "", err
+			}
+			if !result {
+				return "", "", fmt.Errorf("%v is not within the EIP range of EgressGateway %v", perIpv6, eg.Name)
+			}
+		} else {
+			for _, node := range eg.Status.NodeList {
+				for _, eip := range node.Eips {
+					if len(eip.IPv6) != 0 {
+						useIpv6s = append(useIpv6s, net.IP(eip.IPv6))
+					}
+				}
+			}
+
+			ipv6s, _ := utils.ParseIPRanges(constant.IPv6, ipv6Ranges)
+			freeIpv6s := utils.IPsDiffSet(ipv6s, useIpv6s, false)
+
+			if len(freeIpv6s) == 0 {
+				for _, node := range eg.Status.NodeList {
+					if node.Name == nodeName {
+						for _, eip := range node.Eips {
+							if len(eip.IPv6) != 0 {
+								useIpv6sByNode = append(useIpv6s, net.IP(eip.IPv6))
+							}
+						}
+					}
+				}
+
+				rand.Seed(time.Now().UnixNano())
+				perIpv6 = useIpv6sByNode[rand.Intn(len(useIpv6sByNode))].String()
+			} else {
+				rand.Seed(time.Now().UnixNano())
+				perIpv6 = freeIpv6s[rand.Intn(len(freeIpv6s))].String()
+			}
+		}
+	}
+
+	return perIpv4, perIpv6, nil
+}
+
+func getEIPStatus(ipv4 string, eg egress.EgressGateway) egress.Eips {
+	var eipInfo egress.Eips
+	for _, node := range eg.Status.NodeList {
+		for _, eip := range node.Eips {
+			if eip.IPv4 == ipv4 {
+				eipInfo = eip
+			}
+		}
+	}
+
+	return eipInfo
+}
+
+func setEipStatus(ipv4, ipv6 string, nodeName string, policy egress.Policy, nodeListMap map[string]egress.EgressIPStatus) error {
+	eipStatus, ok := nodeListMap[nodeName]
+	if !ok {
+		return fmt.Errorf("the %v node is not a gateway node", nodeName)
+	}
+	isExist := false
+	newEipStatus := egress.EgressIPStatus{}
+
+	for _, eip := range eipStatus.Eips {
+		if ipv4 == eip.IPv4 {
+			eip.Policies = append(eip.Policies, policy)
+
+			isExist = true
+		}
+		newEipStatus.Eips = append(newEipStatus.Eips, eip)
+	}
+
+	if !isExist {
+		newEip := egress.Eips{}
+		newEip.IPv4 = ipv4
+		newEip.IPv6 = ipv6
+		newEip.Policies = append(newEip.Policies, policy)
+		eipStatus.Eips = append(eipStatus.Eips, newEip)
+		nodeListMap[nodeName] = eipStatus
 	} else {
-		hasReady := false
-		hasActive := false
-		for i, node := range list {
-			if !node.Ready {
-				if node.Active {
-					hasChanged = true
-					list[i].Active = false
-				}
-				continue
-			}
-			if node.Active {
-				hasActive = true
-				break
-			}
-			hasChanged = true
-			hasReady = true
-		}
-		if !hasActive && hasReady {
-			hasChanged = true
-			sort.Sort(list)
-			firstReady := -1
-			for i, node := range list {
-				if node.Ready {
-					firstReady = i
-					break
-				}
-			}
-			if firstReady != -1 {
-				list[firstReady].Active = true
-			}
-		}
-	}
-
-	return hasChanged
-}
-
-func filter[T any](ss []T, f func(item T) bool) []T {
-	res := make([]T, 0)
-	for _, s := range ss {
-		if f(s) {
-			res = append(res, s)
-		}
-	}
-	return res
-}
-
-func newEgressGatewayController(mgr manager.Manager, log *zap.Logger, cfg *config.Config) error {
-	if log == nil {
-		return fmt.Errorf("log can not be nil")
-	}
-	if cfg == nil {
-		return fmt.Errorf("cfg can not be nil")
-	}
-	r := &egnReconciler{
-		client: mgr.GetClient(),
-		log:    log,
-		config: cfg,
-	}
-
-	// if err := mgr.GetFieldIndexer().IndexField(context.Background(), &egress.EgressGateway{},
-	// 	indexEgressNodeEgressGateway, func(rawObj client.Object) []string {
-	// 		egn := rawObj.(*egress.EgressGateway)
-	// 		var egressNodes []string
-	// 		for _, node := range egn.Status.NodeList {
-	// 			egressNodes = append(egressNodes,
-	// 				types.NamespacedName{
-	// 					Name: node.Name,
-	// 				}.String(),
-	// 			)
-	// 		}
-	// 		return egressNodes
-	// 	}); err != nil {
-	// 	return err
-	// }
-
-	// if err := mgr.GetFieldIndexer().IndexField(context.Background(), &egress.EgressGateway{},
-	// 	indexNodeEgressGateway, func(rawObj client.Object) []string {
-	// 		egn := rawObj.(*egress.EgressGateway)
-	// 		var egressNodes []string
-	// 		for _, node := range egn.Status.NodeList {
-	// 			egressNodes = append(egressNodes,
-	// 				types.NamespacedName{
-	// 					Name: node.Name,
-	// 				}.String(),
-	// 			)
-	// 		}
-	// 		return egressNodes
-	// 	}); err != nil {
-	// 	return err
-	// }
-
-	c, err := controller.New("egressGateway", mgr,
-		controller.Options{Reconciler: r})
-	if err != nil {
-		return err
-	}
-
-	if err := c.Watch(&source.Kind{Type: &egress.EgressGateway{}},
-		handler.EnqueueRequestsFromMapFunc(utils.KindToMapFlat("EgressGateway"))); err != nil {
-		return fmt.Errorf("failed to watch EgressGateway: %w", err)
-	}
-
-	if err := c.Watch(&source.Kind{Type: &corev1.Node{}},
-		handler.EnqueueRequestsFromMapFunc(utils.KindToMapFlat("Node"))); err != nil {
-		return fmt.Errorf("failed to watch Node: %w", err)
-	}
-
-	if err := c.Watch(&source.Kind{Type: &egress.EgressGatewayPolicy{}},
-		handler.EnqueueRequestsFromMapFunc(utils.KindToMapFlat("Node"))); err != nil {
-		return fmt.Errorf("failed to watch Node: %w", err)
+		nodeListMap[nodeName] = newEipStatus
 	}
 
 	return nil
+}
+
+func mustMarshalJson(obj interface{}) string {
+	raw, err := json.Marshal(obj)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
 }

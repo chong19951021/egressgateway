@@ -34,14 +34,16 @@ func (egw *EgressGatewayWebhook) EgressGatewayValidate(ctx context.Context, req 
 
 	// Checking the number of IPV4 and IPV6 addresses
 	var ipv4s, ipv6s []net.IP
+	ipv4Ranges, _ := utils.MergeIPRanges(constant.IPv4, newEg.Spec.Ranges.IPv4)
+	ipv6Ranges, _ := utils.MergeIPRanges(constant.IPv4, newEg.Spec.Ranges.IPv6)
 	if egw.Config.FileConfig.EnableIPv4 {
-		ipv4s, err = utils.ParseIPRanges(constant.IPv4, newEg.Spec.Ranges.IPv4)
+		ipv4s, err = utils.ParseIPRanges(constant.IPv4, ipv4Ranges)
 		if err != nil {
 			return webhook.Denied(fmt.Sprintf("Failed to check IP: %v", err))
 		}
 	}
 	if egw.Config.FileConfig.EnableIPv6 {
-		ipv6s, err = utils.ParseIPRanges(constant.IPv6, newEg.Spec.Ranges.IPv4)
+		ipv6s, err = utils.ParseIPRanges(constant.IPv6, ipv6Ranges)
 		if err != nil {
 			return webhook.Denied(fmt.Sprintf("Failed to check IP: %v", err))
 		}
@@ -73,10 +75,9 @@ func (egw *EgressGatewayWebhook) EgressGatewayValidate(ctx context.Context, req 
 	}
 
 	// Check whether the IP address to be deleted has been allocated
-	eips, _ := utils.MergeIPRanges(constant.IPv4, newEg.Spec.Ranges.IPv4)
 	for _, item := range eg.Status.NodeList {
 		for _, eip := range item.Eips {
-			result, err := utils.IsIPIncludedRange(constant.IPv4, eip.IPv4, eips)
+			result, err := utils.IsIPIncludedRange(constant.IPv4, eip.IPv4, ipv4Ranges)
 			if err != nil {
 				return webhook.Denied(fmt.Sprintf("Failed to check IP: %v", err))
 			}
