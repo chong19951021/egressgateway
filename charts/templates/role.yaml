@@ -2,7 +2,6 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  creationTimestamp: null
   name: {{ include "project.name" . }}
 rules:
 - apiGroups:
@@ -52,6 +51,7 @@ rules:
 - apiGroups:
   - egressgateway.spidernet.io
   resources:
+  - egressclustergatewaypolicies
   - egressclusterinfos
   - egressendpointslice
   - egressgatewaypolicies
@@ -68,6 +68,7 @@ rules:
 - apiGroups:
   - egressgateway.spidernet.io
   resources:
+  - egressclustergatewaypolicies/status
   - egressclusterinfos/status
   - egressgatewaypolicies/status
   - egressgateways/status

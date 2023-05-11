@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 
+	v1 "k8s.io/api/admission/v1"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -18,10 +19,20 @@ import (
 	egress "github.com/spidernet-io/egressgateway/pkg/k8s/apis/egressgateway.spidernet.io/v1beta1"
 )
 
+const EgressClusterInfo = "EgressClusterInfo"
+
 // ValidateHook ValidateHook
 func ValidateHook(mgr manager.Manager, cfg *config.Config) *webhook.Admission {
 	return &webhook.Admission{
 		Handler: admission.HandlerFunc(func(ctx context.Context, req webhook.AdmissionRequest) webhook.AdmissionResponse {
+			if req.Operation == v1.Delete {
+				switch req.Kind.Kind {
+				case EgressClusterInfo:
+					return webhook.Denied("EgressClusterInfo 'default' is not allowed to be deleted")
+				}
+				return webhook.Allowed("checked")
+			}
+
 			switch req.Kind.Kind {
 			case "EgressGateway":
 				return (&egressgateway.EgressGatewayWebhook{Client: mgr.GetClient(), Config: cfg}).EgressGatewayValidate(ctx, req)

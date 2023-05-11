@@ -4,7 +4,6 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: (unknown)
-  creationTimestamp: null
   name: egressgatewaypolicies.egressgateway.spidernet.io
 spec:
   group: egressgateway.spidernet.io
@@ -17,7 +16,7 @@ spec:
     shortNames:
     - epo
     singular: egressgatewaypolicy
-  scope: Cluster
+  scope: Namespaced
   versions:
   - name: v1beta1
     schema:
