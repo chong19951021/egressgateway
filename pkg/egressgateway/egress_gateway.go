@@ -18,7 +18,11 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"github.com/spidernet-io/egressgateway/pkg/config"
 	"github.com/spidernet-io/egressgateway/pkg/constant"
@@ -80,7 +84,7 @@ func (r egnReconciler) reconcileNode(ctx context.Context, req reconcile.Request,
 		return reconcile.Result{Requeue: true}, nil
 	}
 
-	// 节点删除，节点 NoReady 事件，在监控 EgressNode 中完成
+	// 节点删除。节点 NoReady 事件，则在 EgressNode 事件中完成
 	if deleted {
 		r.log.Info("request item is deleted")
 		err := r.deleteNodeFromEGs(ctx, req.Name, egList)
@@ -133,7 +137,7 @@ func (r egnReconciler) reconcileEG(ctx context.Context, req reconcile.Request, l
 	err := r.client.Get(ctx, req.NamespacedName, eg)
 	if err != nil {
 		if !errors.IsNotFound(err) {
-			return reconcile.Result{}, err
+			return reconcile.Result{Requeue: true}, err
 		}
 		deleted = true
 	}
@@ -154,7 +158,7 @@ func (r egnReconciler) reconcileEG(ctx context.Context, req reconcile.Request, l
 	// 2、通过 status 的nodeList 拿到旧的节点信息
 	// 3、比较需要删除的节点
 	// 4、待删除节点有哪些 policy 的网关节点，重新选网关节点
-	// 5、EIP 再根据 policy 中的配置来生效。也就是说所有的 EIP 都会重新分配
+	// 5、EIP 再根据 policy 中的配置来生效。也就是说待删除节点上所有的 EIP 都会重新分配
 
 	// 1、获取当前最新符合条件的 node
 	newNodeList := &corev1.NodeList{}
@@ -187,13 +191,23 @@ func (r egnReconciler) reconcileEG(ctx context.Context, req reconcile.Request, l
 	}
 	log.Sugar().Debugf("delete a gateway nodes: %d", delNodeList)
 
-	// 3、重新分配网关节点
+	// 重新分配网关节点
 	if len(delNodeList) != 0 {
 		// perNodeListMap 保存最新的 EgressGateway.status.nodeList
 		perNodeListMap := make(map[string]egress.EgressIPStatus, 0)
 		// 初始化 perNodeListMap
 		for _, node := range eg.Status.NodeList {
-			perNodeListMap[node.Name] = node
+			isDel := false
+			for _, item := range delNodeList {
+				if item.Name == node.Name {
+					isDel = true
+					break
+				}
+			}
+
+			if !isDel {
+				perNodeListMap[node.Name] = node
+			}
 		}
 
 		for _, node := range newNodeList.Items {
@@ -213,7 +227,7 @@ func (r egnReconciler) reconcileEG(ctx context.Context, req reconcile.Request, l
 
 		// 逐个 policy 重新分配
 		for _, policy := range reSetPolicies {
-			err = r.reAllocatorPolicy(ctx, policy, *eg, perNodeListMap)
+			err = r.reAllocatorPolicy(ctx, policy, eg, perNodeListMap)
 			if err != nil {
 				log.Sugar().Errorf("reallocator Failed to reassign a gateway node for EgressGatewayPolicy %v: %v", policy, err)
 				return reconcile.Result{Requeue: true}, err
@@ -267,8 +281,8 @@ func (r egnReconciler) reconcileEN(ctx context.Context, req reconcile.Request, l
 			policies, isExist := GetEIPStatusByNode(en.Name, eg)
 			if isExist {
 				perNodeListMap := make(map[string]egress.EgressIPStatus, 0)
-				// 初始化 perNodeListMap
 
+				// 初始化 perNodeListMap
 				for _, node := range eg.Status.NodeList {
 					if node.Name == en.Name {
 						continue
@@ -278,7 +292,7 @@ func (r egnReconciler) reconcileEN(ctx context.Context, req reconcile.Request, l
 				}
 
 				for _, policy := range policies {
-					err = r.reAllocatorPolicy(ctx, policy, eg, perNodeListMap)
+					err = r.reAllocatorPolicy(ctx, policy, &eg, perNodeListMap)
 					if err != nil {
 						log.Sugar().Errorf("reallocator Failed to reassign a gateway node for EgressGatewayPolicy %v: %v", policy, err)
 						return reconcile.Result{Requeue: true}, err
@@ -302,6 +316,129 @@ func (r egnReconciler) reconcileEN(ctx context.Context, req reconcile.Request, l
 			}
 		}
 
+	}
+
+	return reconcile.Result{}, nil
+}
+
+// reconcileEN reconcile egress gateway policy
+func (r egnReconciler) reconcileEGP(ctx context.Context, req reconcile.Request, log *zap.Logger) (reconcile.Result, error) {
+	deleted := false
+	isUpdete := false
+	egp := &egress.EgressGatewayPolicy{}
+	err := r.client.Get(ctx, req.NamespacedName, egp)
+	if err != nil {
+		if !errors.IsNotFound(err) {
+			return reconcile.Result{Requeue: true}, err
+		}
+		deleted = true
+	}
+
+	deleted = deleted || !egp.GetDeletionTimestamp().IsZero()
+
+	egName := egp.Spec.EgressGatewayName
+	eg := &egress.EgressGateway{}
+	err = r.client.Get(ctx, types.NamespacedName{Name: egName}, eg)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return reconcile.Result{}, err
+		}
+		log.Sugar().Errorf("get EgressGateway err:%v", err)
+		return reconcile.Result{Requeue: true}, err
+	}
+
+	policy := egress.Policy{Name: req.Name, Namespace: req.Namespace}
+	if deleted {
+		// 将EgressGateway 中该 policy的信息删除。如果引用的 EIP，已无其他policy 使用，则进行回收。
+		DeletePlocyFromEG(policy, eg)
+
+		log.Sugar().Debugf("update egress gateway status\n%s", mustMarshalJson(eg.Status))
+		err = r.client.Status().Update(ctx, eg)
+		if err != nil {
+			log.Sugar().Errorf("update egress gateway status\n%s", mustMarshalJson(eg.Status))
+			return reconcile.Result{Requeue: true}, err
+		}
+	}
+
+	// policy 是否有网关节点，没有则选择
+	eipStatus, isExist := GetEIPStatusByPolicy(policy, *eg)
+	if !isExist {
+		// 重新分配
+		perNodeListMap := make(map[string]egress.EgressIPStatus, 0)
+		for _, item := range eg.Status.NodeList {
+			perNodeListMap[item.Name] = item
+		}
+
+		err := r.reAllocatorPolicy(ctx, policy, eg, perNodeListMap)
+		if err != nil {
+			r.log.Sugar().Errorf("reallocator Failed to reassign a gateway node for EgressGatewayPolicy %v: %v", policy, err)
+			return reconcile.Result{Requeue: true}, err
+		}
+
+		var perNodeList []egress.EgressIPStatus
+		for _, node := range perNodeListMap {
+			perNodeList = append(perNodeList, node)
+		}
+		eg.Status.NodeList = perNodeList
+
+		isUpdete = true
+		goto update
+	} else {
+		// 如果指定了 EIP，如果 EIP 不对，则纠正。使用节点IP，相当于指定 EIP 为空
+		for i, eip := range eipStatus.Eips {
+			for j, p := range eip.Policies {
+				if p == policy {
+					isReAllocatorPolicy := false
+					if egp.Spec.EgressIP.UseNodeIP && (eip.IPv4 != "" || eip.IPv6 != "") {
+						isReAllocatorPolicy = true
+					} else if egp.Spec.EgressIP.IPv4 != "" && egp.Spec.EgressIP.IPv4 != eip.IPv4 {
+						isReAllocatorPolicy = true
+					} else if egp.Spec.EgressIP.IPv6 != "" && egp.Spec.EgressIP.IPv6 != eip.IPv6 {
+						isReAllocatorPolicy = true
+					}
+
+					if isReAllocatorPolicy {
+						// 当前的 EIP 与指定的不一致。需要重新分配
+						eipStatus.Eips[i].Policies = append(eipStatus.Eips[i].Policies[:j], eipStatus.Eips[i].Policies[j+1:]...)
+						perNodeListMap := make(map[string]egress.EgressIPStatus, 0)
+						// 初始化 perNodeListMap
+						for _, node := range eg.Status.NodeList {
+							if node.Name == eipStatus.Name {
+								perNodeListMap[node.Name] = eipStatus
+							} else {
+								perNodeListMap[node.Name] = node
+							}
+						}
+
+						err := r.reAllocatorPolicy(ctx, policy, eg, perNodeListMap)
+						if err != nil {
+							r.log.Sugar().Errorf("reallocator Failed to reassign a gateway node for EgressGatewayPolicy %v: %v", policy, err)
+							return reconcile.Result{Requeue: true}, err
+						}
+
+						var perNodeList []egress.EgressIPStatus
+						for _, node := range perNodeListMap {
+							perNodeList = append(perNodeList, node)
+						}
+						eg.Status.NodeList = perNodeList
+					}
+
+					isUpdete = true
+					goto update
+				}
+			}
+		}
+
+	}
+
+update:
+	if isUpdete {
+		r.log.Sugar().Debugf("update egress gateway status\n%s", mustMarshalJson(eg.Status))
+		err = r.client.Status().Update(ctx, eg)
+		if err != nil {
+			r.log.Sugar().Errorf("update egress gateway status\n%s", mustMarshalJson(eg.Status))
+			return reconcile.Result{Requeue: true}, err
+		}
 	}
 
 	return reconcile.Result{}, nil
@@ -331,20 +468,20 @@ func (r egnReconciler) deleteNodeFromEGs(ctx context.Context, nodeName string, e
 
 // 将该节点从 EG 中删除
 func (r egnReconciler) deleteNodeFromEG(ctx context.Context, nodeName string, eg egress.EgressGateway) error {
-	// 2、从而拿到对应的 policy
+	// 拿到需要重新分配的 policy
 	policies, isExist := GetEIPStatusByNode(nodeName, eg)
 
 	if isExist {
 		perNodeListMap := make(map[string]egress.EgressIPStatus, 0)
 		for _, item := range eg.Status.NodeList {
 			if nodeName != item.Name {
-				perNodeListMap[nodeName] = item
+				perNodeListMap[item.Name] = item
 			}
 		}
 
-		// 3、重新分配网关节点
+		// 重新分配网关节点
 		for _, policy := range policies {
-			err := r.reAllocatorPolicy(ctx, policy, eg, perNodeListMap)
+			err := r.reAllocatorPolicy(ctx, policy, &eg, perNodeListMap)
 			if err != nil {
 				r.log.Sugar().Errorf("reallocator Failed to reassign a gateway node for EgressGatewayPolicy %v: %v", policy, err)
 				return err
@@ -369,7 +506,7 @@ func (r egnReconciler) deleteNodeFromEG(ctx context.Context, nodeName string, eg
 }
 
 // 重新为 policy 选择网关节点
-func (r egnReconciler) reAllocatorPolicy(ctx context.Context, policy egress.Policy, eg egress.EgressGateway, nodeListMap map[string]egress.EgressIPStatus) error {
+func (r egnReconciler) reAllocatorPolicy(ctx context.Context, policy egress.Policy, eg *egress.EgressGateway, nodeListMap map[string]egress.EgressIPStatus) error {
 	egp := &egress.EgressGatewayPolicy{}
 	err := r.client.Get(ctx, types.NamespacedName{Namespace: policy.Namespace, Name: policy.Name}, egp)
 	if err != nil {
@@ -383,7 +520,7 @@ func (r egnReconciler) reAllocatorPolicy(ctx context.Context, policy egress.Poli
 	}
 
 	// 分配 EIP
-	ipv4, ipv6, err := r.allocatorEIP("", perNode, *egp, eg)
+	ipv4, ipv6, err := r.allocatorEIP("", perNode, *egp, *eg)
 	if err != nil {
 		return err
 	}
@@ -492,9 +629,8 @@ func (r egnReconciler) allocatorEIP(selEipLolicy string, nodeName string, egp eg
 	}
 
 	if r.config.FileConfig.EnableIPv6 {
-
 		if len(perIpv4) != 0 {
-			return perIpv4, GetEIPStatus(perIpv4, eg).IPv6, nil
+			return perIpv4, GetEipByIP(perIpv4, eg).IPv6, nil
 		}
 
 		var useIpv6s []net.IP
@@ -546,8 +682,50 @@ func (r egnReconciler) allocatorEIP(selEipLolicy string, nodeName string, egp eg
 	return perIpv4, perIpv6, nil
 }
 
+func NewEgressGatewayController(mgr manager.Manager, log *zap.Logger, cfg *config.Config) error {
+	if log == nil {
+		return fmt.Errorf("log can not be nil")
+	}
+	if cfg == nil {
+		return fmt.Errorf("cfg can not be nil")
+	}
+	r := &egnReconciler{
+		client: mgr.GetClient(),
+		log:    log,
+		config: cfg,
+	}
+
+	c, err := controller.New("egressGateway", mgr,
+		controller.Options{Reconciler: r})
+	if err != nil {
+		return err
+	}
+
+	if err := c.Watch(&source.Kind{Type: &egress.EgressGateway{}},
+		handler.EnqueueRequestsFromMapFunc(utils.KindToMapFlat("EgressGateway"))); err != nil {
+		return fmt.Errorf("failed to watch EgressGateway: %w", err)
+	}
+
+	if err := c.Watch(&source.Kind{Type: &corev1.Node{}},
+		handler.EnqueueRequestsFromMapFunc(utils.KindToMapFlat("Node"))); err != nil {
+		return fmt.Errorf("failed to watch Node: %w", err)
+	}
+
+	if err := c.Watch(&source.Kind{Type: &egress.EgressGatewayPolicy{}},
+		handler.EnqueueRequestsFromMapFunc(utils.KindToMapFlat("EgressGatewayPolicy"))); err != nil {
+		return fmt.Errorf("failed to watch Node: %w", err)
+	}
+
+	if err := c.Watch(&source.Kind{Type: &egress.EgressNode{}},
+		handler.EnqueueRequestsFromMapFunc(utils.KindToMapFlat("EgressNode"))); err != nil {
+		return fmt.Errorf("failed to watch Node: %w", err)
+	}
+
+	return nil
+}
+
 // 从 EG 获取单个 EIP 的信息
-func GetEIPStatus(ipv4 string, eg egress.EgressGateway) egress.Eips {
+func GetEipByIP(ipv4 string, eg egress.EgressGateway) egress.Eips {
 	var eipInfo egress.Eips
 	for _, node := range eg.Status.NodeList {
 		for _, eip := range node.Eips {
@@ -621,4 +799,55 @@ func GetEIPStatusByNode(nodeName string, eg egress.EgressGateway) ([]egress.Poli
 	}
 
 	return policies, isExist
+}
+
+// 从 EG 获取某个 policy 的网关节点信息
+func GetEIPStatusByPolicy(policy egress.Policy, eg egress.EgressGateway) (egress.EgressIPStatus, bool) {
+	var eipStatus egress.EgressIPStatus
+	isExist := false
+
+	for _, item := range eg.Status.NodeList {
+		for _, eip := range item.Eips {
+			for _, p := range eip.Policies {
+				if p == policy {
+					eipStatus = item
+					isExist = true
+				}
+			}
+		}
+	}
+
+	return eipStatus, isExist
+}
+
+// 从一个 EG 中删除某个 policy
+func DeletePlocyFromEG(policy egress.Policy, eg *egress.EgressGateway) {
+	var policies []egress.Policy
+	var eips []egress.Eips
+
+	for i, node := range eg.Status.NodeList {
+		for j, eip := range node.Eips {
+			for k, item := range eip.Policies {
+				if item == policy {
+					policies = append(eip.Policies[:k], eip.Policies[k+1:]...)
+
+					if len(policies) == 0 {
+						// Release EIP
+						for x, e := range node.Eips {
+							if eip.IPv4 == e.IPv4 || eip.IPv6 == e.IPv6 {
+								eips = append(node.Eips[:x], node.Eips[x+1:]...)
+								break
+							}
+						}
+						eg.Status.NodeList[i].Eips = eips
+					} else {
+						eg.Status.NodeList[i].Eips[j].Policies = policies
+					}
+					goto breakHere
+				}
+			}
+		}
+	}
+breakHere:
+	return
 }

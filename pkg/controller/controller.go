@@ -17,6 +17,7 @@ import (
 	"github.com/spidernet-io/egressgateway/pkg/config"
 	"github.com/spidernet-io/egressgateway/pkg/controller/metrics"
 	"github.com/spidernet-io/egressgateway/pkg/controller/webhook"
+	"github.com/spidernet-io/egressgateway/pkg/egressgateway"
 	"github.com/spidernet-io/egressgateway/pkg/logger"
 	"github.com/spidernet-io/egressgateway/pkg/schema"
 	"github.com/spidernet-io/egressgateway/pkg/types"
@@ -75,7 +76,7 @@ func New(cfg *config.Config, log *zap.Logger) (types.Service, error) {
 	//	return nil, fmt.Errorf("failed to create node controller: %w", err)
 	//}
 	//
-	err = newEgressGatewayController(mgr, log, cfg)
+	err = egressgateway.NewEgressGatewayController(mgr, log, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create egress gateway controller: %w", err)
 	}
