@@ -23,7 +23,7 @@ import (
 
 	"github.com/spidernet-io/egressgateway/pkg/config"
 	"github.com/spidernet-io/egressgateway/pkg/ipam"
-	egressv1 "github.com/spidernet-io/egressgateway/pkg/k8s/apis/egressgateway.spidernet.io/v1"
+	egress "github.com/spidernet-io/egressgateway/pkg/k8s/apis/egressgateway.spidernet.io/v1beta1"
 	"github.com/spidernet-io/egressgateway/pkg/utils"
 )
 
@@ -87,7 +87,7 @@ func (r *egReconciler) reconcileNode(ctx context.Context, req reconcile.Request,
 
 	if deleted {
 		log.Sugar().Infof("reconcileNode: Delete %v event", req.Name)
-		en := new(egressv1.EgressNode)
+		en := new(egress.EgressNode)
 		en.Name = req.Name
 		err := r.client.Delete(ctx, en)
 		if err != nil {
@@ -99,14 +99,14 @@ func (r *egReconciler) reconcileNode(ctx context.Context, req reconcile.Request,
 	}
 
 	log.Sugar().Infof("reconcileNode: Update %v event", req.Name)
-	en := new(egressv1.EgressNode)
+	en := new(egress.EgressNode)
 	err = r.client.Get(ctx, req.NamespacedName, en)
 	if err != nil {
 		if !errors.IsNotFound(err) {
 			return reconcile.Result{Requeue: true}, err
 		}
 		en.Name = req.Name
-		en.Status.Phase = egressv1.EgressNodePending
+		en.Status.Phase = egress.EgressNodePending
 
 		r.log.Sugar().Infof("create egressnode=%v", en)
 		err = r.client.Create(context.Background(), en)
@@ -117,20 +117,20 @@ func (r *egReconciler) reconcileNode(ctx context.Context, req reconcile.Request,
 	} else {
 		var egIP, egIPv6 string
 		if r.ipam.EnableIPv4 {
-			egIP = en.Status.VxlanIPv4
+			egIP = en.Status.Tunnel.IPv4
 		}
 
 		if r.ipam.EnableIPv6 {
-			egIPv6 = en.Status.VxlanIPv6
+			egIPv6 = en.Status.Tunnel.IPv6
 		}
 
 		if (r.ipam.EnableIPv4 && egIP == "") || (r.ipam.EnableIPv6 && egIPv6 == "") {
 			log.Sugar().Infof("EnableIPv4=%v, egIP=%v, EnableIPv6=%v, egIPv6=%v; en.Status.Phase set Pending", r.ipam.EnableIPv4, egIP, r.ipam.EnableIPv6, egIPv6)
-			en.Status.Phase = egressv1.EgressNodePending
+			en.Status.Phase = egress.EgressNodePending
 		} else {
 			if (r.ipam.EnableIPv4 && !r.ipam.CheckIsOK(egIP)) || (r.ipam.EnableIPv6 && !r.ipam.CheckIsOK(egIPv6)) {
 				log.Sugar().Infof("ip check failure; EnableIPv4=%v, egIP=%v, EnableIPv6=%v, egIPv6=%v; en.Status.Phase set Pending", r.ipam.EnableIPv4, egIP, r.ipam.EnableIPv6, egIPv6)
-				en.Status.Phase = egressv1.EgressNodePending
+				en.Status.Phase = egress.EgressNodePending
 			} else {
 				var node, nodeByIPv6 string
 				if r.ipam.EnableIPv4 {
@@ -147,16 +147,16 @@ func (r *egReconciler) reconcileNode(ctx context.Context, req reconcile.Request,
 
 				if node != nodeByIPv6 || node != en.Name {
 					log.Sugar().Infof("The node(%v) bound to IPv4(%v) and IPV6(%v) is incorrect ", en.Name, node, nodeByIPv6)
-					en.Status.Phase = egressv1.EgressNodePending
-					en.Status.VxlanIPv4 = ""
-					en.Status.VxlanIPv6 = ""
+					en.Status.Phase = egress.EgressNodePending
+					en.Status.Tunnel.IPv4 = ""
+					en.Status.Tunnel.IPv6 = ""
 				} else {
-					if en.Status.Phase == egressv1.EgressNodeSucceeded {
+					if en.Status.Phase == egress.EgressNodeSucceeded {
 						log.Sugar().Infof("egressnode(%v) is in Succeeded state", en)
 						isUpdate = false
 					} else {
 						log.Sugar().Infof("egressnode(%v) is in Init state", en)
-						en.Status.Phase = egressv1.EgressNodeInit
+						en.Status.Phase = egress.EgressNodeInit
 					}
 
 					// To be determined
@@ -196,7 +196,7 @@ func (r *egReconciler) reconcileNode(ctx context.Context, req reconcile.Request,
 func (r *egReconciler) reconcileEN(ctx context.Context,
 	req reconcile.Request, log *zap.Logger) (reconcile.Result, error) {
 	deleted := false
-	en := &egressv1.EgressNode{}
+	en := &egress.EgressNode{}
 	err := r.client.Get(ctx, req.NamespacedName, en)
 	if err != nil {
 		if !errors.IsNotFound(err) {
@@ -239,9 +239,9 @@ func (r *egReconciler) reconcileEN(ctx context.Context,
 
 		if node.GetDeletionTimestamp().IsZero() {
 			log.Sugar().Infof("If the node(%v) exists and is not deleted, create a new EgressNode", req.Name)
-			newEn := new(egressv1.EgressNode)
+			newEn := new(egress.EgressNode)
 			newEn.Name = req.Name
-			newEn.Status.Phase = egressv1.EgressNodePending
+			newEn.Status.Phase = egress.EgressNodePending
 			r.log.Sugar().Infof("create egressnode=%v", newEn)
 			err = r.client.Create(ctx, newEn)
 			if err != nil {
@@ -254,30 +254,30 @@ func (r *egReconciler) reconcileEN(ctx context.Context,
 	}
 
 	log.Sugar().Infof("reconcileEN: Update %v event, en.Status.Phase=%v", req.Name, en.Status.Phase)
-	if en.Status.Phase != egressv1.EgressNodeInit && en.Status.Phase != egressv1.EgressNodeSucceeded {
+	if en.Status.Phase != egress.EgressNodeInit && en.Status.Phase != egress.EgressNodeSucceeded {
 		log.Sugar().Infof("If the EgressNode(%v) is not in Init or Succeeded state, an IP address is assigned", en.Name)
 		if r.ipam.EnableIPv4 {
 			ip, err := r.ipam.Acquire(en.Name)
 			if err != nil {
 				log.Error("EgressNode failed to request IP")
-				en.Status.Phase = egressv1.EgressNodeFailed
+				en.Status.Phase = egress.EgressNodeFailed
 
 				if updateErr := r.client.Status().Update(ctx, en); updateErr != nil {
 					log.Sugar().Errorf("Description Failed to update the status to Failed")
 				}
 				return reconcile.Result{Requeue: true}, err
 			}
-			en.Status.VxlanIPv4 = ip.String()
+			en.Status.Tunnel.IPv4 = ip.String()
 		}
 
 		if r.ipam.EnableIPv6 {
 			ip, err := r.ipam.AcquireIPv6(en.Name)
 			if err != nil {
 				log.Error("EgressNode failed to request IPV6")
-				en.Status.Phase = egressv1.EgressNodeFailed
+				en.Status.Phase = egress.EgressNodeFailed
 				if r.ipam.EnableIPv4 {
-					if err := r.ipam.ReleaseByIP(en.Status.VxlanIPv4); err != nil {
-						log.Sugar().Errorf("IP(%v) release failure", en.Status.VxlanIPv4)
+					if err := r.ipam.ReleaseByIP(en.Status.Tunnel.IPv4); err != nil {
+						log.Sugar().Errorf("IP(%v) release failure", en.Status.Tunnel.IPv4)
 					}
 				}
 
@@ -286,33 +286,33 @@ func (r *egReconciler) reconcileEN(ctx context.Context,
 				}
 				return reconcile.Result{Requeue: true}, err
 			}
-			en.Status.VxlanIPv6 = ip.String()
+			en.Status.Tunnel.IPv6 = ip.String()
 		}
 
-		en.Status.TunnelMac, err = GenerateMACAddress(en.Name)
+		en.Status.Tunnel.MAC, err = GenerateMACAddress(en.Name)
 		if err != nil {
 			log.Sugar().Errorf("%v hardware address generation failed", en.Name)
 			if r.ipam.EnableIPv4 {
-				if err := r.ipam.ReleaseByIP(en.Status.VxlanIPv4); err != nil {
-					log.Sugar().Errorf("IP(%v) release failure", en.Status.VxlanIPv4)
+				if err := r.ipam.ReleaseByIP(en.Status.Tunnel.IPv4); err != nil {
+					log.Sugar().Errorf("IP(%v) release failure", en.Status.Tunnel.IPv4)
 				}
 			}
 
 			if r.ipam.EnableIPv6 {
-				if err := r.ipam.ReleaseByIP(en.Status.VxlanIPv6); err != nil {
-					log.Sugar().Errorf("IP(%v) release failure", en.Status.VxlanIPv4)
+				if err := r.ipam.ReleaseByIP(en.Status.Tunnel.IPv6); err != nil {
+					log.Sugar().Errorf("IP(%v) release failure", en.Status.Tunnel.IPv6)
 				}
 			}
 
-			en.Status.Phase = egressv1.EgressNodeFailed
+			en.Status.Phase = egress.EgressNodeFailed
 			if updateErr := r.client.Status().Update(ctx, en); updateErr != nil {
 				log.Sugar().Errorf("Description Failed to update the status to Failed")
 			}
 			return reconcile.Result{Requeue: true}, err
 		}
-		log.Sugar().Infof("The Mac address generated for the node(%v) is %v", en.Name, en.Status.TunnelMac)
+		log.Sugar().Infof("The Mac address generated for the node(%v) is %v", en.Name, en.Status.Tunnel.MAC)
 
-		en.Status.Phase = egressv1.EgressNodeInit
+		en.Status.Phase = egress.EgressNodeInit
 
 		log.Sugar().Infof("update egressnode=%v", en)
 		err = r.client.Status().Update(ctx, en)
@@ -353,7 +353,7 @@ func newEgressNodeController(mgr manager.Manager, log *zap.Logger, cfg *config.C
 	}
 
 	log.Sugar().Infof("egressnode controller watch EgressNode")
-	if err := c.Watch(&source.Kind{Type: &egressv1.EgressNode{}},
+	if err := c.Watch(&source.Kind{Type: &egress.EgressNode{}},
 		handler.EnqueueRequestsFromMapFunc(utils.KindToMapFlat("EgressNode"))); err != nil {
 		return fmt.Errorf("failed to watch EgressNode: %w", err)
 	}
@@ -388,14 +388,14 @@ func (r *egReconciler) initEgressNode() error {
 
 	for _, node := range nodes.Items {
 		r.log.Sugar().Infof("Init egressnode=%v", node.Name)
-		en := new(egressv1.EgressNode)
+		en := new(egress.EgressNode)
 		err := r.client.Get(context.Background(), types.NamespacedName{Namespace: node.Namespace, Name: node.Name}, en)
 		if err != nil {
 			if !errors.IsNotFound(err) {
 				return fmt.Errorf("Failed to obtain the EgressNode；err(%v)", err)
 			}
 			en.Name = node.Name
-			en.Status.Phase = egressv1.EgressNodePending
+			en.Status.Phase = egress.EgressNodePending
 			r.log.Sugar().Infof("create egressnode=%v", en)
 			err = r.client.Create(context.Background(), en)
 			if err != nil {
@@ -404,8 +404,8 @@ func (r *egReconciler) initEgressNode() error {
 			}
 		}
 
-		ip := en.Status.VxlanIPv4
-		ipv6 := en.Status.VxlanIPv6
+		ip := en.Status.Tunnel.IPv4
+		ipv6 := en.Status.Tunnel.IPv6
 
 		r.log.Sugar().Infof("name=%v, ipv4=%v, ipv6=%v", en.Name, ip, ipv6)
 
