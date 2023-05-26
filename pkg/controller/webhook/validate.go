@@ -19,24 +19,29 @@ import (
 	egressv1 "github.com/spidernet-io/egressgateway/pkg/k8s/apis/egressgateway.spidernet.io/v1"
 )
 
+const EgressGateway = "EgressGateway"
+const EgressGatewayPolicy = "EgressGatewayPolicy"
 const EgressClusterInfo = "EgressClusterInfo"
 
 // ValidateHook ValidateHook
 func ValidateHook(client client.Client, cfg *config.Config) *webhook.Admission {
 	return &webhook.Admission{
 		Handler: admission.HandlerFunc(func(ctx context.Context, req webhook.AdmissionRequest) webhook.AdmissionResponse {
-			if req.Operation == v1.Delete {
-				switch req.Kind.Kind {
-				case EgressClusterInfo:
+			switch req.Kind.Kind {
+			case EgressClusterInfo:
+				if req.Operation == v1.Delete {
 					return webhook.Denied("EgressClusterInfo 'default' is not allowed to be deleted")
 				}
-				return webhook.Allowed("checked")
-			}
 
-			switch req.Kind.Kind {
-			case "EgressGateway":
+			case EgressGateway:
+				fmt.Printf("webhook EG: %v\n", req.Name)
 				return (&egressgateway.EgressGatewayWebhook{Client: client, Config: cfg}).EgressGatewayValidate(ctx, req)
-			case "EgressGatewayPolicy":
+
+			case EgressGatewayPolicy:
+				if req.Operation == v1.Delete {
+					return webhook.Allowed("checked")
+				}
+
 				policy := new(egressv1.EgressGatewayPolicy)
 				err := json.Unmarshal(req.Object.Raw, policy)
 				if err != nil {

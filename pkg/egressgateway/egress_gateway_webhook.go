@@ -26,6 +26,24 @@ type EgressGatewayWebhook struct {
 }
 
 func (egw *EgressGatewayWebhook) EgressGatewayValidate(ctx context.Context, req webhook.AdmissionRequest) webhook.AdmissionResponse {
+	// Check whether the deleted EgressGateway is referenced
+	if req.Operation == v1.Delete {
+		eg := new(egress.EgressGateway)
+		err := json.Unmarshal(req.OldObject.Raw, eg)
+		if err != nil {
+			return webhook.Denied(fmt.Sprintf("json unmarshal EgressGateway with error: %v", err))
+		}
+
+		for _, item := range eg.Status.NodeList {
+			for _, eip := range item.Eips {
+				if len(eip.Policies) != 0 {
+					return webhook.Denied(fmt.Sprintf("Do not delete %v:%v because it is already referenced by EgressGatewayPolicy", req.Namespace, req.Name))
+				}
+			}
+		}
+		return webhook.Allowed("checked")
+	}
+
 	newEg := new(egress.EgressGateway)
 	err := json.Unmarshal(req.Object.Raw, newEg)
 	if err != nil {
@@ -50,12 +68,14 @@ func (egw *EgressGatewayWebhook) EgressGatewayValidate(ctx context.Context, req 
 			return webhook.Denied(fmt.Sprintf("Failed to check IP: %v", err))
 		}
 	}
+
 	if egw.Config.FileConfig.EnableIPv6 {
 		ipv6s, err = utils.ParseIPRanges(constant.IPv6, ipv6Ranges)
 		if err != nil {
 			return webhook.Denied(fmt.Sprintf("Failed to check IP: %v", err))
 		}
 	}
+
 	if egw.Config.FileConfig.EnableIPv4 && egw.Config.FileConfig.EnableIPv6 {
 		if len(ipv4s) != len(ipv6s) {
 			return webhook.Denied("The number of ipv4 and ipv6 is not equal")
@@ -70,18 +90,6 @@ func (egw *EgressGatewayWebhook) EgressGatewayValidate(ctx context.Context, req 
 		}
 	}
 
-	// Check whether the deleted EgressGateway is referenced
-	if req.Operation == v1.Delete {
-		for _, item := range eg.Status.NodeList {
-			for _, eip := range item.Eips {
-				if len(eip.Policies) != 0 {
-					return webhook.Denied(fmt.Sprintf("Do not delete %v:%v because it is already referenced by EgressGatewayPolicy", req.Namespace, req.Name))
-				}
-			}
-		}
-		return webhook.Allowed("checked")
-	}
-
 	// Check whether the IP address to be deleted has been allocated
 	for _, item := range eg.Status.NodeList {
 		for _, eip := range item.Eips {
@@ -89,7 +97,6 @@ func (egw *EgressGatewayWebhook) EgressGatewayValidate(ctx context.Context, req 
 			if err != nil {
 				return webhook.Denied(fmt.Sprintf("Failed to check IP: %v", err))
 			}
-
 			if !result {
 				return webhook.Denied(fmt.Sprintf("%v has been allocated and cannot be deleted", eip.IPv4))
 			}
