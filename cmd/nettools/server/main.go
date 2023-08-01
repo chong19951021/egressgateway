@@ -51,6 +51,10 @@ func main() {
 	wg.Wait()
 }
 
+func hello(w http.ResponseWriter, req *http.Request) {
+	_, _ = fmt.Fprintf(w, "Remote IP: %s\n", req.RemoteAddr)
+}
+
 func tcpServer(config utils.Config) {
 	defer wg.Done()
 	var tcpAddr *net.TCPAddr
@@ -141,8 +145,8 @@ func udpServer(config utils.Config) {
 
 func websocketServer(config utils.Config) {
 	defer wg.Done()
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/", hello)
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		conn, _ := upgrader.Upgrade(w, r, nil) // error ignored for sake of simplicity
 
 		for {

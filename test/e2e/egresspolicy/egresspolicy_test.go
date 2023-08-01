@@ -4,6 +4,8 @@
 package egresspolicy_test
 
 import (
+	"log"
+	"os"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -142,15 +144,42 @@ var _ = Describe("EgressPolicy", func() {
 			GinkgoWriter.Printf("Check export ip in dsB: %s pods\n", dsNameB)
 			checkEip(podAList, v4Eip, v6Eip, serverIPv4A, serverIPv6A, true, time.Second*5)
 
+			logf, err := os.OpenFile("/tmp/testlogfile", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+			if err != nil {
+				log.Fatalf("error opening file: %v", err)
+			}
+			defer logf.Close()
+
+			log.SetOutput(logf)
+			log.Println("=================================")
+
 			// update policy matched podA to match podB
 			By("case P00014: update policy matched podA to match podB")
 			if isGlobal {
+				log.Println("isGlobal")
 				// update egressClusterPolicy
 				updatePolicy(egressPolicyName, egressClusterPolicy, podBLabel, nil)
 			} else {
+				log.Println("is namespace level")
 				// update egressPolicy
 				updatePolicy(egressPolicyName, egressPolicy, podBLabel, nil)
 			}
+
+			log.Println("pods list A")
+			for i, pod := range podAList.Items {
+				log.Printf("%d %s\n", i, pod.Name)
+			}
+
+			log.Println("pods list B")
+			for i, pod := range podBList.Items {
+				log.Printf("%d %s\n", i, pod.Name)
+			}
+
+			log.Println("serverIPv4A", serverIPv4A)
+			log.Println("serverIPv6A", serverIPv6A)
+
+			log.Println("v4Eip", v4Eip)
+			log.Println("v6Eip", v6Eip)
 
 			// check eip in podB, we expect pods export ip is eip
 			GinkgoWriter.Printf("Check export ip in dsB: %s pods\n", dsNameB)
