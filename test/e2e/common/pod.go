@@ -68,6 +68,32 @@ func CreatePod(ctx context.Context, cli client.Client, image string) (*corev1.Po
 	}
 }
 
+func CreatePodCustom(ctx context.Context, cli client.Client, image string, setUp func(pod *corev1.Pod)) (*corev1.Pod, error) {
+	var terminationGracePeriodSeconds int64 = 0
+
+	res := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{},
+		Spec: corev1.PodSpec{
+			TerminationGracePeriodSeconds: &terminationGracePeriodSeconds,
+			Containers: []corev1.Container{
+				{
+					Name:            "test-container",
+					Image:           image,
+					ImagePullPolicy: corev1.PullIfNotPresent,
+					Command:         []string{"/bin/sh", "-c", "sleep infinity"},
+				},
+			},
+		}}
+
+	setUp(res)
+
+	err := cli.Create(ctx, res)
+	if err != nil {
+		return nil, fmt.Errorf("error:\n%w\npod yaml:\n%s\n", err, GetObjYAML(res))
+	}
+	return res, nil
+}
+
 // CreatePods create pods by gaven number "n"
 func CreatePods(ctx context.Context, cli client.Client, img string, n int) []*corev1.Pod {
 	var res []*corev1.Pod

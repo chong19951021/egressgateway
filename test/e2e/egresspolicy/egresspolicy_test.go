@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-faker/faker/v4"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	egressv1 "github.com/spidernet-io/egressgateway/pkg/k8s/apis/v1beta1"
@@ -39,6 +40,8 @@ var _ = Describe("EgressPolicy", Ordered, func() {
 		DeferCleanup(func() {
 			// delete EgressGateway
 			if egw != nil {
+				// todo @bzsuni waiting finalizer-feature to be done
+				time.Sleep(time.Second * 3)
 				err = common.DeleteObj(ctx, cli, egw)
 				Expect(err).NotTo(HaveOccurred())
 			}
@@ -537,6 +540,91 @@ var _ = Describe("EgressPolicy", Ordered, func() {
 				err = common.CheckDaemonSetEgressIP(ctx, cli, config, egressConfig, ds, node2IPv4, node2IPv6, true)
 				Expect(err).NotTo(HaveOccurred())
 			})
+		})
+	})
+
+	// namespace-level policy 只生效在其指定的namespace中
+	/*
+		1. 创建 ns test-ns
+		2. 在 default， test-ns 命名空间中分别创建同名 pod
+		3. 在 default 命名空间 创建 policy， PodSelector 对应以上 pod 的 label
+		4. 检测 default 命名空间中的 pod 出口 IP 应该为 policy 的 eip
+		5. 检测 test-ns 命名空间中的 pod 出口 IP 不应为 policy 的 eip
+
+	*/
+
+	Context("namespace-level policy", Label("P00021"), func() {
+		var ctx context.Context
+		var testNs *corev1.Namespace
+		var podName string
+		var podObj, podObjNs *corev1.Pod
+		var podLabel map[string]string
+		var err error
+		var egp *egressv1.EgressPolicy
+
+		BeforeEach(func() {
+			ctx = context.Background()
+			podName = "pod-" + uuid.NewString()
+			podLabel = map[string]string{"app": podName}
+
+			DeferCleanup(func() {
+				// delete ns
+				if testNs != nil {
+					Expect(common.DeleteObj(ctx, cli, testNs)).NotTo(HaveOccurred())
+				}
+				// delete pods
+				if podObj != nil {
+					Expect(common.DeleteObj(ctx, cli, podObj)).NotTo(HaveOccurred())
+				}
+				if podObjNs != nil {
+					Expect(common.DeleteObj(ctx, cli, podObjNs)).NotTo(HaveOccurred())
+				}
+
+				// delete egresspolicy
+				if egp != nil {
+					Expect(common.DeleteObj(ctx, cli, egp)).NotTo(HaveOccurred())
+				}
+			})
+		})
+
+		It("test the scope of policy", func() {
+			// create ns test-ns
+			testNs = &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-ns",
+				},
+			}
+			Expect(cli.Create(ctx, testNs)).NotTo(HaveOccurred())
+
+			// create a pod in default namespace
+			podObj, err = common.CreatePodCustom(ctx, cli, config.Image, func(pod *corev1.Pod) {
+				pod.Name = podName
+				pod.Namespace = "default"
+				pod.Labels = podLabel
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// create a name-same pod in namepace test-ns
+			podObjNs, err = common.CreatePodCustom(ctx, cli, config.Image, func(pod *corev1.Pod) {
+				pod.Name = podName
+				pod.Namespace = testNs.Name
+				pod.Labels = podLabel
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// create policy in default namespace
+			egp, err = common.CreateEgressPolicyNew(ctx, cli, egressConfig, egw.Name, podLabel)
+			Expect(err).NotTo(HaveOccurred())
+
+			// check eip of the pod in default namespace
+			if egressConfig.EnableIPv4 {
+				err = common.CheckPodEgressIP(ctx, config, *podObj, egp.Status.Eip.Ipv4, config.ServerAIPv4, true)
+				Expect(err).NotTo(HaveOccurred())
+			}
+			if egressConfig.EnableIPv6 {
+				err = common.CheckPodEgressIP(ctx, config, *podObj, egp.Status.Eip.Ipv6, config.ServerAIPv6, true)
+				Expect(err).NotTo(HaveOccurred())
+			}
 		})
 	})
 })
